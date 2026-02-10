@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Update
 from aiogram.client.default import DefaultBotProperties
 
 # Загрузка переменных
@@ -22,7 +23,6 @@ DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mysecret123")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
@@ -32,26 +32,17 @@ dp = Dispatcher()
 
 # База данных
 def get_connection():
-    """Подключение к PostgreSQL"""
     return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD,
         cursor_factory=RealDictCursor,
     )
 
 def main_keyboard() -> ReplyKeyboardMarkup:
-    """Основная клавиатура"""
-    kb = [
-        [KeyboardButton(text="Получить код")],
-        [KeyboardButton(text="Профиль")],
-    ]
+    kb = [["Получить код"], ["Профиль"]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def ensure_user(telegram_user):
-    """Сохраняет/обновляет пользователя"""
     conn = get_connection()
     try:
         with conn:
@@ -61,20 +52,15 @@ def ensure_user(telegram_user):
                     INSERT INTO users (telegram_id, username, first_name)
                     VALUES (%s, %s, %s)
                     ON CONFLICT (telegram_id) DO UPDATE
-                    SET username = EXCLUDED.username,
-                        first_name = EXCLUDED.first_name
+                    SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
                     """,
-                    (
-                        telegram_user.id,
-                        telegram_user.username,
-                        telegram_user.first_name,
-                    ),
+                    (telegram_user.id, telegram_user.username, telegram_user.first_name),
                 )
     finally:
         conn.close()
 
 def user_has_code_today(telegram_id: int) -> bool:
-    """Проверяет код на сегодня"""
+    """Проверяет, брал ли пользователь код сегодня"""
     conn = get_connection()
     try:
         with conn:
@@ -83,7 +69,8 @@ def user_has_code_today(telegram_id: int) -> bool:
                     """
                     SELECT COUNT(*) AS cnt
                     FROM codes
-                    WHERE user_id = %s AND created_at::date = CURRENT_DATE
+                    WHERE user_id = %s
+                      AND created_at::date = CURRENT_DATE
                     """,
                     (telegram_id,),
                 )
@@ -98,35 +85,45 @@ def get_user_stats(telegram_id: int):
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+                cur.execute(
+                    "SELECT * FROM users WHERE telegram_id = %s",
+                    (telegram_id,),
+                )
                 user_row = cur.fetchone()
-                
-                cur.execute("SELECT COUNT(*) AS cnt FROM codes WHERE user_id = %s", (telegram_id,))
+
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM codes WHERE user_id = %s",
+                    (telegram_id,),
+                )
                 codes_count_row = cur.fetchone()
-                
+
                 return user_row, codes_count_row["cnt"]
     finally:
         conn.close()
 
 def generate_code(length: int = 20) -> str:
-    """Генерация кода"""
+    """Генерирует случайный код"""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return "".join(random.choices(alphabet, k=length))
 
 def save_code(telegram_id: int, code: str):
-    """Сохранение кода"""
+    """Сохраняет код в БД"""
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO codes (user_id, code) VALUES (%s, %s)", (telegram_id, code))
+                cur.execute(
+                    "INSERT INTO codes (user_id, code) VALUES (%s, %s)",
+                    (telegram_id, code),
+                )
     finally:
         conn.close()
 
-# Обработчики сообщений
+# Хэндлеры
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     ensure_user(message.from_user)
+    
     text = (
         "👋 Привет! Я бот для генерации кодов.\n\n"
         "📋 Функции:\n"
@@ -166,4 +163,41 @@ async def cmd_profile(message: Message):
     ensure_user(message.from_user)
     tg_id = message.from_user.id
 
-    user_row, codes_count = get_
+    user_row, codes_count = get_user_stats(tg_id)
+
+    if not user_row:
+        await message.answer("❌ Профиль не найден. Напиши /start")
+        return
+
+    text = (
+        f"👤 **Твой профиль**\n\n"
+        f"🆔 ID: `{user_row['telegram_id']}`\n"
+        f"👤 Имя: {user_row.get('first_name', 'Не указано')}\n"
+        f"📛 Username: @{user_row.get('username', 'Не указан')}\n"
+        f"📅 Зарегистрирован: {user_row['created_at'].strftime('%d.%m.%Y')}\n\n"
+        f"📊 **Статистика**\n"
+        f"Всего кодов: **{codes_count}**"
+    )
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
+
+# FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Установка webhook при запуске
+    print(f"🤖 Установка webhook: {WEBHOOK_URL}")
+    await bot.set_webhook(WEBHOOK_URL)
+    yield
+    # Удаление webhook при выключении
+    await bot.delete_webhook()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post(WEBHOOK_PATH)
+async def webhook(update: Update, _: Request):
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"message": "Bot is running!"}
