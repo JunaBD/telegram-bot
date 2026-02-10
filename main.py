@@ -210,12 +210,15 @@ async def root():
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    """Webhook обработчик"""
-    update = await request.json()
+    """Webhook обработчик Telegram"""
+    raw_update = await request.json()
     
-    # Передаем update в диспетчер aiogram
+    # Правильное создание Update объекта
+    from aiogram.types import Update
+    update = Update(**raw_update)
+    update.bot = bot  # Обязательно!
+    
     await dp.feed_update(bot, update)
-    
     return {"status": "ok"}
 
 if __name__ == "__main__":
