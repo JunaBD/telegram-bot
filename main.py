@@ -26,6 +26,8 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
+print(f"🤖 Starting bot with webhook: {WEBHOOK_URL}")
+
 # Глобальные объекты
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -60,7 +62,6 @@ def ensure_user(telegram_user):
         conn.close()
 
 def user_has_code_today(telegram_id: int) -> bool:
-    """Проверяет, брал ли пользователь код сегодня"""
     conn = get_connection()
     try:
         with conn:
@@ -80,7 +81,6 @@ def user_has_code_today(telegram_id: int) -> bool:
         conn.close()
 
 def get_user_stats(telegram_id: int):
-    """Статистика пользователя"""
     conn = get_connection()
     try:
         with conn:
@@ -102,12 +102,10 @@ def get_user_stats(telegram_id: int):
         conn.close()
 
 def generate_code(length: int = 20) -> str:
-    """Генерирует случайный код"""
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return "".join(random.choices(alphabet, k=length))
 
 def save_code(telegram_id: int, code: str):
-    """Сохраняет код в БД"""
     conn = get_connection()
     try:
         with conn:
@@ -123,7 +121,6 @@ def save_code(telegram_id: int, code: str):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     ensure_user(message.from_user)
-    
     text = (
         "👋 Привет! Я бот для генерации кодов.\n\n"
         "📋 Функции:\n"
@@ -181,16 +178,17 @@ async def cmd_profile(message: Message):
     
     await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
-# FastAPI
+# FastAPI - ВСЁ В КОНЦЕ!
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Установка webhook при запуске
-    print(f"🤖 Установка webhook: {WEBHOOK_URL}")
+    print("🚀 Starting bot...")
     await bot.set_webhook(WEBHOOK_URL)
+    print(f"✅ Webhook set: {WEBHOOK_URL}")
     yield
-    # Удаление webhook при выключении
+    print("🛑 Shutting down bot...")
     await bot.delete_webhook()
 
+# ✅ app = ПЕРВЫЙ создаём, потом декораторы!
 app = FastAPI(lifespan=lifespan)
 
 @app.post(WEBHOOK_PATH)
@@ -200,4 +198,8 @@ async def webhook(update: Update, _: Request):
 
 @app.get("/")
 async def root():
-    return {"message": "Bot is running!"}
+    return {"message": "🤖 Bot is running!"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
