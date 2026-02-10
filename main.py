@@ -1,54 +1,47 @@
 from fastapi import FastAPI, Request
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Update
-from aiogram.client.default import DefaultBotProperties
-import os
-import random
-from dotenv import load_dotenv
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from contextlib import asynccontextmanager
+import os
+from dotenv import load_dotenv
 
-# Загрузка переменных
+# 1. Загрузка переменных ПЕРВЫМИ
 load_dotenv()
 
-# Переменные окружения
+# 2. FastAPI ПЕРВЫЙ (до всех импортов!)
+app = FastAPI()
+
+# 3. Переменные ПОСЛЕ app
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
-print(f"🤖 Bot token: {'OK' if BOT_TOKEN else 'MISSING'}")
-print(f"🗄️ DB host: {'OK' if DB_HOST else 'MISSING'}")
-print(f"🌐 Webhook URL: {WEBHOOK_URL}")
+print(f"🤖 Starting bot... Token: {'OK' if BOT_TOKEN else 'MISSING'}")
+print(f"🌐 Webhook: {WEBHOOK_URL}")
 
-# Бот и диспетчер ГЛОБАЛЬНО (до app!)
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-# База данных
-def get_connection():
-    return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        cursor_factory=RealDictCursor,
+# 4. Ленивые функции (импорты внутри функций)
+def get_db_connection():
+    from psycopg import connect
+    return connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
     )
 
+async def get_bot():
+    from aiogram import Bot
+    from aiogram.client.default import DefaultBotProperties
+    from aiogram.enums import ParseMode
+    return Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
 def main_keyboard():
+    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
     kb = [["Получить код"], ["Профиль"]]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
+# База данных (ленивая)
 def ensure_user(telegram_user):
-    conn = get_connection()
+    conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -60,13 +53,13 @@ def ensure_user(telegram_user):
                     SET username = EXCLUDED.username, 
                         first_name = EXCLUDED.first_name
                     """,
-                    (telegram_user.id, telegram_user.username, telegram_user.first_name or ''),
+                    (telegram_user.id, telegram_user.username or '', telegram_user.first_name or ''),
                 )
     finally:
         conn.close()
 
 def user_has_code_today(telegram_id: int) -> bool:
-    conn = get_connection()
+    conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -79,29 +72,17 @@ def user_has_code_today(telegram_id: int) -> bool:
                     (telegram_id,),
                 )
                 row = cur.fetchone()
-                return row["cnt"] > 0
-    finally:
-        conn.close()
-
-def get_user_stats(telegram_id: int):
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-                user_row = cur.fetchone()
-                cur.execute("SELECT COUNT(*) AS cnt FROM codes WHERE user_id = %s", (telegram_id,))
-                codes_count = cur.fetchone()["cnt"]
-                return user_row, codes_count
+                return row[0] > 0
     finally:
         conn.close()
 
 def generate_code(length=20) -> str:
+    import random
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return "".join(random.choices(alphabet, k=length))
 
 def save_code(telegram_id: int, code: str):
-    conn = get_connection()
+    conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -112,83 +93,101 @@ def save_code(telegram_id: int, code: str):
     finally:
         conn.close()
 
-# ХЭНДЛЕРЫ
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    ensure_user(message.from_user)
-    await message.answer(
-        "👋 Привет! Генератор кодов!\n\n"
-        "📋 Один код в день\n"
-        "👤 Статистика в профиле\n\n"
-        "Нажми «Получить код»!",
-        reply_markup=main_keyboard()
-    )
-
-@dp.message(F.text == "Получить код", Command("code"))
-async def cmd_code(message: Message):
-    ensure_user(message.from_user)
-    tg_id = message.from_user.id
-
-    if user_has_code_today(tg_id):
-        await message.answer(
-            "⏳ Код на сегодня уже получен!\n"
-            "🔄 Новый завтра!",
-            reply_markup=main_keyboard()
-        )
-        return
-
-    code = generate_code()
-    save_code(tg_id, code)
-    
-    await message.answer(
-        f"✅ **Твой код:**\n\n"
-        f"```{code}```\n\n"
-        f"💾 Сохранено в профиле!",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
-
-@dp.message(F.text == "Профиль")
-async def cmd_profile(message: Message):
-    ensure_user(message.from_user)
-    tg_id = message.from_user.id
-
-    user_row, codes_count = get_user_stats(tg_id)
-    if not user_row:
-        await message.answer("❌ /start сначала!")
-        return
-
-    text = (
-        f"👤 **Профиль**\n\n"
-        f"🆔 `{user_row['telegram_id']}`\n"
-        f"👤 {user_row.get('first_name', '—')}\n"
-        f"📛 @{user_row.get('username', '—')}\n"
-        f"📅 {user_row['created_at'].strftime('%d.%m.%Y')}\n\n"
-        f"📊 **Кодов: {codes_count}**"
-    )
-    await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
-
-# LIFESPAN (ДО app!)
+# 5. Lifespan (установка webhook)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Запуск бота...")
+    print("🚀 Starting bot...")
+    bot = await get_bot()
     await bot.set_webhook(WEBHOOK_URL)
-    print(f"✅ Webhook: {WEBHOOK_URL}")
+    print(f"✅ Webhook установлен: {WEBHOOK_URL}")
     yield
-    print("🛑 Остановка...")
+    print("🛑 Stopping bot...")
     await bot.delete_webhook()
 
-# ✅ APP ПЕРВЫЙ ВСЁ!
+# 6. Переопределяем app с lifespan
 app = FastAPI(lifespan=lifespan)
 
+# 7. Роуты
 @app.post(WEBHOOK_PATH)
-async def webhook(update: Update):
-    await dp.feed_update(bot, update)
+async def webhook(update: dict):
+    from aiogram import Dispatcher
+    from aiogram.types import Update
+    from aiogram.filters import CommandStart, Command
+    from aiogram import F
+    
+    bot = await get_bot()
+    dp = Dispatcher()
+    
+    # Хэндлеры внутри webhook (чтобы избежать проблем с импортами)
+    @dp.message(CommandStart())
+    async def cmd_start(message):
+        ensure_user(message.from_user)
+        await message.answer(
+            "👋 Привет! Генератор кодов!\n\n"
+            "📋 Один код в день\n"
+            "👤 Статистика в профиле\n\n"
+            "Нажми «Получить код»!",
+            reply_markup=main_keyboard()
+        )
+    
+    @dp.message(F.text == "Получить код", Command("code"))
+    async def cmd_code(message):
+        ensure_user(message.from_user)
+        tg_id = message.from_user.id
+        
+        if user_has_code_today(tg_id):
+            await message.answer(
+                "⏳ Код на сегодня уже получен!\n🔄 Новый завтра!",
+                reply_markup=main_keyboard()
+            )
+            return
+        
+        code = generate_code()
+        save_code(tg_id, code)
+        
+        await message.answer(
+            f"✅ **Твой код:**\n\n```{code}```\n\n💾 Сохранено!",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard()
+        )
+    
+    @dp.message(F.text == "Профиль")
+    async def cmd_profile(message):
+        ensure_user(message.from_user)
+        tg_id = message.from_user.id
+        
+        conn = get_db_connection()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM users WHERE telegram_id = %s", (tg_id,))
+                    user_row = cur.fetchone()
+                    if not user_row:
+                        await message.answer("❌ /start сначала!")
+                        return
+                    
+                    cur.execute("SELECT COUNT(*) AS cnt FROM codes WHERE user_id = %s", (tg_id,))
+                    codes_count = cur.fetchone()[0]
+                    
+                    text = (
+                        f"👤 **Профиль**\n\n"
+                        f"🆔 `{user_row[0]}`\n"
+                        f"👤 {user_row[2] or '—'}\n"
+                        f"📛 @{user_row[1] or '—'}\n"
+                        f"📊 Кодов: **{codes_count}**"
+                    )
+                    await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
+        finally:
+            conn.close()
+    
+    # Обработка update
+    update_obj = Update(**update)
+    await dp.feed_update(bot, update_obj)
     return {"ok": True}
 
 @app.get("/")
 async def root():
-    return {"status": "🤖 Bot OK"}
+    return {"status": "🤖 Bot работает!"}
 
 if __name__ == "__main__":
     import uvicorn
