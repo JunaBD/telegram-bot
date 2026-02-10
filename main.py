@@ -2,13 +2,22 @@ from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Update
+from aiogram.filters import CommandStart, Command
 
 load_dotenv()
+
 app = FastAPI()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+
+# Глобальный диспетчер
+dp = Dispatcher()
 
 print(f"🤖 Bot starting... Webhook: {WEBHOOK_URL}")
 
@@ -23,16 +32,12 @@ def get_db_connection():
     )
 
 async def get_bot():
-    from aiogram import Bot
-    from aiogram.client.default import DefaultBotProperties
-    from aiogram.enums import ParseMode
     return Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 def main_keyboard():
-    from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
     kb = [
-        [KeyboardButton(text="Получить код")],  # ✅ KeyboardButton!
-        [KeyboardButton(text="Профиль")]        # ✅ KeyboardButton!
+        [KeyboardButton(text="Получить код")],
+        [KeyboardButton(text="Профиль")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -101,6 +106,55 @@ def get_user_stats(telegram_id: int):
     finally:
         conn.close()
 
+# Регистрация обработчиков
+@dp.message(CommandStart())
+async def cmd_start(message):
+    ensure_user(message.from_user)
+    await message.answer(
+        "👋 Генератор кодов!\n\n📋 Один код в день\n👤 Профиль\n\nНажми «Получить код»!",
+        reply_markup=main_keyboard()
+    )
+
+@dp.message(F.text == "Получить код")
+async def cmd_code(message):
+    ensure_user(message.from_user)
+    tg_id = message.from_user.id
+    
+    if user_has_code_today(tg_id):
+        await message.answer(
+            "⏳ Код на сегодня получен!\n🔄 Новый завтра!",
+            reply_markup=main_keyboard()
+        )
+        return
+    
+    code = generate_code()
+    save_code(tg_id, code)
+    
+    await message.answer(
+        f"✅ **Код:**\n\n```\n{code}\n```\n\n💾 Сохранено!",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
+    )
+
+@dp.message(F.text == "Профиль")
+async def cmd_profile(message):
+    ensure_user(message.from_user)
+    tg_id = message.from_user.id
+    
+    user_row, codes_count = get_user_stats(tg_id)
+    if not user_row:
+        await message.answer("❌ /start сначала!")
+        return
+    
+    text = (
+        f"👤 **Профиль**\n\n"
+        f"🆔 `{user_row[0]}`\n"
+        f"👤 {user_row[2] or '—'}\n"
+        f"📛 @{user_row[1] or '—'}\n"
+        f"📊 **Кодов: {codes_count}**"
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting...")
@@ -115,61 +169,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post(WEBHOOK_PATH)
 async def webhook(update: dict):
-    from aiogram import Dispatcher, F
-    from aiogram.types import Update
-    from aiogram.filters import CommandStart, Command
-    
     bot = await get_bot()
-    dp = Dispatcher()
-    
-    @dp.message(CommandStart())
-    async def cmd_start(message):
-        ensure_user(message.from_user)
-        await message.answer(
-            "👋 Генератор кодов!\n\n📋 Один код в день\n👤 Профиль\n\nНажми «Получить код»!",
-            reply_markup=main_keyboard()
-        )
-    
-    @dp.message(Command("code"), F.text == "Получить код")
-    async def cmd_code(message):
-        ensure_user(message.from_user)
-        tg_id = message.from_user.id
-        
-        if user_has_code_today(tg_id):
-            await message.answer(
-                "⏳ Код на сегодня получен!\n🔄 Новый завтра!",
-                reply_markup=main_keyboard()
-            )
-            return
-        
-        code = generate_code()
-        save_code(tg_id, code)
-        
-        await message.answer(
-            f"✅ **Код:**\n\n```\n{code}\n```\n\n💾 Сохранено!",
-            parse_mode="Markdown",
-            reply_markup=main_keyboard()
-        )
-    
-    @dp.message(F.text == "Профиль")
-    async def cmd_profile(message):
-        ensure_user(message.from_user)
-        tg_id = message.from_user.id
-        
-        user_row, codes_count = get_user_stats(tg_id)
-        if not user_row:
-            await message.answer("❌ /start сначала!")
-            return
-        
-        text = (
-            f"👤 **Профиль**\n\n"
-            f"🆔 `{user_row[0]}`\n"
-            f"👤 {user_row[2] or '—'}\n"
-            f"📛 @{user_row[1] or '—'}\n"
-            f"📊 **Кодов: {codes_count}**"
-        )
-        await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
-    
     update_obj = Update(**update)
     await dp.feed_update(bot, update_obj)
     return {"ok": True}
