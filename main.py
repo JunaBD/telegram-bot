@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+from datetime import datetime
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 import psycopg2
@@ -10,9 +11,11 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.webhook import handle_update, webhook_factory
+from aiogram.client.default import DefaultBotProperties
 
+# Загрузка переменных
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
@@ -23,8 +26,11 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mysecret123")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
+# Инициализация
 dp = Dispatcher()
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
+# База данных
 def get_connection():
     return psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
@@ -92,11 +98,16 @@ def save_code(telegram_id: int, code: str):
     finally:
         conn.close()
 
+# Обработчики
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     ensure_user(message.from_user)
     await message.answer(
-        "👋 Привет! Я бот для генерации кодов.\n\n📋 Функции:\n• Один уникальный код в день\n• Статистика в профиле\n\nНажми «Получить код» для начала!",
+        "👋 Привет! Я бот для генерации кодов.\n\n"
+        "📋 Функции:\n"
+        "• Один уникальный код в день\n"
+        "• Статистика в профиле\n\n"
+        "Нажми «Получить код» для начала!",
         reply_markup=main_keyboard()
     )
 
@@ -105,45 +116,59 @@ async def cmd_start(message: Message):
 async def cmd_code(message: Message):
     ensure_user(message.from_user)
     tg_id = message.from_user.id
+    
     if user_has_code_today(tg_id):
         await message.answer(
-            "⏳ Сегодня ты уже получал код.\nНовый код будет доступен завтра!",
+            "⏳ Сегодня ты уже получал код.\n"
+            "Новый код будет доступен завтра!",
             reply_markup=main_keyboard()
         )
         return
+    
     code = generate_code()
     save_code(tg_id, code)
+    
     await message.answer(
-        f"✅ Твой код на сегодня:\n\n`{code}`\n\n💾 Код сохранён в твоём профиле!",
-        parse_mode="Markdown", reply_markup=main_keyboard()
+        f"✅ Твой код на сегодня:\n\n"
+        f"`{code}`\n\n"
+        f"💾 Код сохранён в твоём профиле!",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
     )
 
 @dp.message(F.text == "Профиль")
 async def cmd_profile(message: Message):
     ensure_user(message.from_user)
     tg_id = message.from_user.id
+    
     user_row, codes_count = get_user_stats(tg_id)
+    
     if not user_row:
         await message.answer("❌ Профиль не найден. Напиши /start")
         return
+    
     text = (
         f"👤 **Твой профиль**\n\n"
         f"🆔 ID: `{user_row['telegram_id']}`\n"
         f"👤 Имя: {user_row.get('first_name', 'Не указано')}\n"
         f"📛 Username: @{user_row.get('username', 'Не указан')}\n"
         f"📅 Зарегистрирован: {user_row['created_at'].strftime('%d.%m.%Y')}\n\n"
-        f"📊 **Статистика**\nВсего кодов: **{codes_count}**"
+        f"📊 **Статистика**\n"
+        f"Всего кодов: **{codes_count}**"
     )
     await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
+# FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    # Startup
     await bot.delete_webhook(drop_pending_updates=True)
-    webhook = webhook_factory(bot.token, dispatcher=dp, secret_token=WEBHOOK_SECRET, path=WEBHOOK_PATH)
     await bot.set_webhook(WEBHOOK_URL)
     print(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    
     yield
+    
+    # Shutdown
     await bot.delete_webhook()
     await bot.session.close()
 
@@ -154,12 +179,17 @@ async def root():
     return {"message": "Bot is running!"}
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(update: dict):
-    bot = Bot.get_current()
-    await handle_update(bot, dp, update)
+async def telegram_webhook(request: Request):
+    """Обработчик webhook от Telegram"""
+    json_data = await request.json()
+    update = json_data
+    
+    # Обрабатываем update через диспетчер
+    await dp.feed_update(bot, update)
+    
     return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
