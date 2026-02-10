@@ -3,21 +3,15 @@ from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
 
-# 1. Загрузка переменных ПЕРВЫМИ
 load_dotenv()
-
-# 2. FastAPI ПЕРВЫЙ (до всех импортов!)
 app = FastAPI()
 
-# 3. Переменные ПОСЛЕ app
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
 
-print(f"🤖 Starting bot... Token: {'OK' if BOT_TOKEN else 'MISSING'}")
-print(f"🌐 Webhook: {WEBHOOK_URL}")
+print(f"🤖 Bot starting... Webhook: {WEBHOOK_URL}")
 
-# 4. Ленивые функции (импорты внутри функций)
 def get_db_connection():
     from psycopg import connect
     return connect(
@@ -36,10 +30,12 @@ async def get_bot():
 
 def main_keyboard():
     from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-    kb = [["Получить код"], ["Профиль"]]
+    kb = [
+        [KeyboardButton(text="Получить код")],  # ✅ KeyboardButton!
+        [KeyboardButton(text="Профиль")]        # ✅ KeyboardButton!
+    ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# База данных (ленивая)
 def ensure_user(telegram_user):
     conn = get_db_connection()
     try:
@@ -71,8 +67,7 @@ def user_has_code_today(telegram_id: int) -> bool:
                     """,
                     (telegram_id,),
                 )
-                row = cur.fetchone()
-                return row[0] > 0
+                return cur.fetchone()[0] > 0
     finally:
         conn.close()
 
@@ -93,51 +88,56 @@ def save_code(telegram_id: int, code: str):
     finally:
         conn.close()
 
-# 5. Lifespan (установка webhook)
+def get_user_stats(telegram_id: int):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+                user_row = cur.fetchone()
+                cur.execute("SELECT COUNT(*) AS cnt FROM codes WHERE user_id = %s", (telegram_id,))
+                codes_count = cur.fetchone()[0]
+                return user_row, codes_count
+    finally:
+        conn.close()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Starting bot...")
+    print("🚀 Starting...")
     bot = await get_bot()
     await bot.set_webhook(WEBHOOK_URL)
-    print(f"✅ Webhook установлен: {WEBHOOK_URL}")
+    print(f"✅ Webhook OK: {WEBHOOK_URL}")
     yield
-    print("🛑 Stopping bot...")
+    print("🛑 Stopping...")
     await bot.delete_webhook()
 
-# 6. Переопределяем app с lifespan
 app = FastAPI(lifespan=lifespan)
 
-# 7. Роуты
 @app.post(WEBHOOK_PATH)
 async def webhook(update: dict):
-    from aiogram import Dispatcher
+    from aiogram import Dispatcher, F
     from aiogram.types import Update
     from aiogram.filters import CommandStart, Command
-    from aiogram import F
     
     bot = await get_bot()
     dp = Dispatcher()
     
-    # Хэндлеры внутри webhook (чтобы избежать проблем с импортами)
     @dp.message(CommandStart())
     async def cmd_start(message):
         ensure_user(message.from_user)
         await message.answer(
-            "👋 Привет! Генератор кодов!\n\n"
-            "📋 Один код в день\n"
-            "👤 Статистика в профиле\n\n"
-            "Нажми «Получить код»!",
+            "👋 Генератор кодов!\n\n📋 Один код в день\n👤 Профиль\n\nНажми «Получить код»!",
             reply_markup=main_keyboard()
         )
     
-    @dp.message(F.text == "Получить код", Command("code"))
+    @dp.message(Command("code"), F.text == "Получить код")
     async def cmd_code(message):
         ensure_user(message.from_user)
         tg_id = message.from_user.id
         
         if user_has_code_today(tg_id):
             await message.answer(
-                "⏳ Код на сегодня уже получен!\n🔄 Новый завтра!",
+                "⏳ Код на сегодня получен!\n🔄 Новый завтра!",
                 reply_markup=main_keyboard()
             )
             return
@@ -146,7 +146,7 @@ async def webhook(update: dict):
         save_code(tg_id, code)
         
         await message.answer(
-            f"✅ **Твой код:**\n\n```{code}```\n\n💾 Сохранено!",
+            f"✅ **Код:**\n\n```\n{code}\n```\n\n💾 Сохранено!",
             parse_mode="Markdown",
             reply_markup=main_keyboard()
         )
@@ -156,31 +156,20 @@ async def webhook(update: dict):
         ensure_user(message.from_user)
         tg_id = message.from_user.id
         
-        conn = get_db_connection()
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT * FROM users WHERE telegram_id = %s", (tg_id,))
-                    user_row = cur.fetchone()
-                    if not user_row:
-                        await message.answer("❌ /start сначала!")
-                        return
-                    
-                    cur.execute("SELECT COUNT(*) AS cnt FROM codes WHERE user_id = %s", (tg_id,))
-                    codes_count = cur.fetchone()[0]
-                    
-                    text = (
-                        f"👤 **Профиль**\n\n"
-                        f"🆔 `{user_row[0]}`\n"
-                        f"👤 {user_row[2] or '—'}\n"
-                        f"📛 @{user_row[1] or '—'}\n"
-                        f"📊 Кодов: **{codes_count}**"
-                    )
-                    await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
-        finally:
-            conn.close()
+        user_row, codes_count = get_user_stats(tg_id)
+        if not user_row:
+            await message.answer("❌ /start сначала!")
+            return
+        
+        text = (
+            f"👤 **Профиль**\n\n"
+            f"🆔 `{user_row[0]}`\n"
+            f"👤 {user_row[2] or '—'}\n"
+            f"📛 @{user_row[1] or '—'}\n"
+            f"📊 **Кодов: {codes_count}**"
+        )
+        await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
     
-    # Обработка update
     update_obj = Update(**update)
     await dp.feed_update(bot, update_obj)
     return {"ok": True}
